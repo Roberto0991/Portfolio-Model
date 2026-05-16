@@ -1,0 +1,178 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import t
+
+def simulate_t_portfolio_losses(
+    portfolio: pd.DataFrame, 
+    region_corr: pd.DataFrame, 
+    asset_correlation: float, 
+    degrees_of_freedom: int,
+    num_simulations: int
+) -> pd.DataFrame:
+    """
+    Simulates portfolio defaults using a Student's t-Copula approach to capture heavy tails.
+    
+    Args:
+        portfolio (pd.DataFrame): Portfolio data (ID, Exposure, PD, Region).
+        region_corr (pd.DataFrame): Correlation matrix between regions.
+        asset_correlation (float): Weight of the region factor (R-squared).
+        degrees_of_freedom (int): Controls tail heaviness (lower = fatter tails).
+        num_simulations (int): Number of Monte Carlo paths.
+    """
+    num_positions = len(portfolio)
+    regions = region_corr.columns.tolist()
+    num_regions = len(regions)
+    
+    # Step 1: Handle the linear correlation using Cholesky Decomposition
+    L = np.linalg.cholesky(region_corr.values)
+    independent_region_shocks = np.random.normal(0, 1, size=(num_regions, num_simulations))
+    correlated_region_shocks = np.dot(L, independent_region_shocks)
+    
+    # Map region names to row indices for fast lookup
+    region_to_idx = {region: idx for idx, region in enumerate(regions)}
+    
+    # Step 2: Generate the "Heavy Tail" scaling factor for the t-distribution
+    # We draw from a Chi-Squared distribution. This creates a global macroeconomic 
+    # multiplier that affects ALL positions simultaneously during extreme downside paths.
+    chi_square_drifts = np.random.chisquare(df=degrees_of_freedom, size=num_simulations)
+    t_scaling_factor = np.sqrt(chi_square_drifts / degrees_of_freedom)
+    
+    # Step 3: Map default thresholds using the Inverse CDF of the Student's t-distribution
+    portfolio['Threshold'] = t.ppf(portfolio['PD'], df=degrees_of_freedom)
+    
+    # Step 4: Run the asset simulation loop (Vectorized)
+    # Map region to index for all rows
+    region_indices = portfolio['Region'].map(region_to_idx).values
+    
+    # Extract correlated region shocks for each position (Shape: num_positions x num_simulations)
+    systemic_shocks = correlated_region_shocks[region_indices, :]
+    
+    # Generate independent unique company shocks (Shape: num_positions x num_simulations)
+    idiosyncratic_shocks = np.random.normal(0, 1, size=(num_positions, num_simulations))
+    
+    # Mix the systemic and idiosyncratic shocks (Gaussian mixture)
+    w_systemic = np.sqrt(asset_correlation)
+    w_idiosyncratic = np.sqrt(1 - asset_correlation)
+    gaussian_mix = (w_systemic * systemic_shocks) + (w_idiosyncratic * idiosyncratic_shocks)
+    
+    # Transform the mixture into a Student's t-distributed asset return
+    # Broadcasting over the second dimension, since t_scaling_factor is (num_simulations,)
+    asset_returns = gaussian_mix / t_scaling_factor
+    
+    # Check for defaults (Asset Return falls below the structural threshold)
+    thresholds = portfolio['Threshold'].values[:, None] # Reshape to (num_positions, 1) for broadcasting
+    is_default = asset_returns < thresholds
+    
+    # Aggregate results across all positions
+    exposures = portfolio['Exposure'].values[:, None]
+    sim_total_defaults = is_default.sum(axis=0)
+    sim_total_losses = (is_default * exposures).sum(axis=0)
+
+    return pd.DataFrame({
+        'Simulation_ID': np.arange(1, num_simulations + 1),
+        'Total_Defaults': sim_total_defaults,
+        'Total_Loss': sim_total_losses
+    })
+
+def calculate_risk_metrics(
+    simulation_results: pd.DataFrame, 
+    portfolio: pd.DataFrame, 
+    confidence_level: float = 0.95
+) -> None:
+    """Calculates summary risk metrics for portfolio pricing."""
+    total_portfolio_value = portfolio['Exposure'].sum()
+    expected_loss = simulation_results['Total_Loss'].mean()
+    
+    percentile = confidence_level * 100
+    var_cl = np.percentile(simulation_results['Total_Loss'], percentile)
+    cvar_cl = simulation_results[simulation_results['Total_Loss'] >= var_cl]['Total_Loss'].mean()
+    
+    print("==================================================")
+    print("      HEAVY-TAILED (t-COPULA) RISK METRICS        ")
+    print("==================================================")
+    print(f"Total Portfolio Exposure : ${total_portfolio_value:,.2f}")
+    print(f"Expected Loss (EL)       : ${expected_loss:,.2f} ({expected_loss/total_portfolio_value*100:.2f}%)")
+    print(f"Value at Risk ({percentile:g}% VaR)  : ${var_cl:,.2f}")
+    print(f"Expected Shortfall ({percentile:g}%) : ${cvar_cl:,.2f}")
+    print("==================================================")
+
+def plot_risk_metrics(simulation_results: pd.DataFrame, confidence_level: float = 0.99):
+    """Generates a visualization for the portfolio loss distribution."""
+    losses = simulation_results['Total_Loss']
+    expected_loss = losses.mean()
+    percentile = confidence_level * 100
+    var_cl = np.percentile(losses, percentile)
+    cvar_cl = losses[losses >= var_cl].mean()
+    
+    # Set the style
+    sns.set_theme(style="darkgrid")
+    plt.figure(figsize=(12, 6))
+    
+    # Plot histogram with KDE
+    sns.histplot(losses, bins=50, kde=True, color="steelblue", stat="density", alpha=0.6)
+    
+    # Add vertical lines for risk metrics
+    plt.axvline(expected_loss, color='green', linestyle='dashed', linewidth=2, label=f'Expected Loss: ${expected_loss:,.0f}')
+    plt.axvline(var_cl, color='orange', linestyle='dashed', linewidth=2, label=f'{percentile:g}% VaR: ${var_cl:,.0f}')
+    plt.axvline(cvar_cl, color='red', linestyle='dashed', linewidth=2, label=f'{percentile:g}% CVaR: ${cvar_cl:,.0f}')
+    
+    plt.title(f'Portfolio Loss Distribution ({len(losses):,} Simulations)', fontsize=16, fontweight='bold')
+    plt.xlabel('Total Loss ($)', fontsize=12)
+    plt.ylabel('Density', fontsize=12)
+    plt.legend(loc='upper right')
+    
+    # Format x-axis with commas
+    ax = plt.gca()
+    ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, loc: "{:,}".format(int(x))))
+    
+    plt.tight_layout()
+    plt.savefig('loss_distribution.png', dpi=300)
+    print("\n[+] Saved loss distribution plot to 'loss_distribution.png'")
+
+
+# =====================================================================
+#                          INPUTS & CONFIGURATION
+# =====================================================================
+if __name__ == "__main__":
+    
+    # 1. Simulation Parameters
+    NUM_SIMULATIONS = 10000
+    DEGREES_OF_FREEDOM = 4       # Lower = heavier tails/more severe black swans (typically 3 to 6)
+    ASSET_CORRELATION = 0.30     # How much asset risk is driven by its region environment (0.0 to 1.0)
+    
+    # 2. Portfolio Inputs (ID, Exposure, Probability of Default, Region)
+    df_portfolio = pd.DataFrame({
+        'ID':       [1, 2, 3, 4, 5, 6, 7, 8],
+        'Exposure': [1000000, 2500000, 500000, 4000000, 1500000, 3000000, 800000, 1200000],
+        'PD':       [0.02, 0.05, 0.01, 0.08, 0.03, 0.06, 0.01, 0.04],
+        'Region':   ['Asia', 'Africa', 'Latin America', 'Latin America', 'Asia', 'Africa', 'Asia', 'Latin America']
+    })
+    
+    # 3. Region Correlation Matrix
+    regions = ['Asia', 'Africa', 'Latin America']
+    corr_matrix = pd.DataFrame(
+        [
+            [1.00, 0.30, 0.40],  # Asia
+            [0.30, 1.00, 0.25],  # Africa
+            [0.40, 0.25, 1.00]   # Latin America
+        ], 
+        index=regions, 
+        columns=regions
+    )
+    
+    # --- Execute Simulation ---
+    results = simulate_t_portfolio_losses(
+        portfolio=df_portfolio,
+        region_corr=corr_matrix,
+        asset_correlation=ASSET_CORRELATION,
+        degrees_of_freedom=DEGREES_OF_FREEDOM,
+        num_simulations=NUM_SIMULATIONS
+    )
+    
+    # --- Display Metrics ---
+    calculate_risk_metrics(results, df_portfolio)
+    
+    # --- Generate Visuals ---
+    plot_risk_metrics(results)
